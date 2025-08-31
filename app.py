@@ -1,46 +1,91 @@
 import os, re, time, logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 from flask import Flask, request, abort
 from dotenv import load_dotenv
 
-# Twilio response helper (no Twilio client needed for replies)
+# Twilio reply helper (TwiML)
 from twilio.twiml.messaging_response import MessagingResponse
 
-# Optional: OpenAI (LLM replies). If you don't want AI, leave OPENAI_API_KEY unset.
+# We use the OpenAI client for BOTH OpenAI and Groq (Groq exposes an OpenAI-compatible API).
 try:
     from openai import OpenAI
 except Exception:
-    OpenAI = None
+    OpenAI = None  # we'll handle gracefully
 
 load_dotenv()
 
+# ---- Config from environment -------------------------------------------------
 APP_NAME = os.getenv("APP_NAME", "ZP WhatsApp Bot")
-ADMIN_PASSCODE = os.getenv("ADMIN_PASSCODE", "1234")  # simple admin gate for quick ops
 
-# Optional AI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")  # cheap+fast; change if you wish
+# Simple admin op passcode
+ADMIN_PASSCODE = os.getenv("ADMIN_PASSCODE", "1234")
 
-# Basic in-memory session store (replace with Redis/Postgres for production)
+# LLM provider selection: "groq", "openai", or leave blank to disable AI fallback
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+
+# Keys (set only what you use)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+
+# Optional base URLs (rarely change; defaults are fine)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip() or None
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "").strip() or "https://api.groq.com/openai/v1"
+
+# Optional explicit model override (else we pick a sensible default per provider)
+AI_MODEL_OVERRIDE = os.getenv("AI_MODEL", "").strip()
+
+# ------------------------------------------------------------------------------
+# In-memory sessions (swap for Redis/DB in production)
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-def get_ai_client():
-    if OPENAI_API_KEY and OpenAI is not None:
-        return OpenAI(api_key=OPENAI_API_KEY)
-    return None
-
-AI = get_ai_client()
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-# --- Utilities ----------------------------------------------------------------
+# ---- LLM wiring --------------------------------------------------------------
+def build_ai_client() -> Tuple[Optional[str], Optional[Any], str]:
+    """
+    Returns: (provider, client, model_name)
+      - provider: "groq" | "openai" | None
+      - client:   OpenAI client object (or None)
+      - model:    resolved model string for the provider
+    """
+    if OpenAI is None:
+        return None, None, ""
+
+    # If user has chosen Groq (recommended for you right now)
+    if LLM_PROVIDER == "groq" and GROQ_API_KEY:
+        client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+        model = AI_MODEL_OVERRIDE or os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+        return "groq", client, model
+
+    # If user has chosen OpenAI
+    if LLM_PROVIDER == "openai" and OPENAI_API_KEY:
+        client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+        model = AI_MODEL_OVERRIDE or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        return "openai", client, model
+
+    # If no explicit provider, auto-select by available key (Groq preferred if present)
+    if GROQ_API_KEY:
+        client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+        model = AI_MODEL_OVERRIDE or os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+        return "groq", client, model
+    if OPENAI_API_KEY:
+        client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+        model = AI_MODEL_OVERRIDE or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        return "openai", client, model
+
+    return None, None, ""
+
+
+AI_PROVIDER, AI_CLIENT, AI_MODEL = build_ai_client()
+
+
+# ---- Helpers -----------------------------------------------------------------
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip()).lower()
 
 def reply_text(body: str) -> str:
-    """Return TwiML XML as string with a single WhatsApp message reply."""
     resp = MessagingResponse()
     resp.message(body)
     return str(resp)
@@ -76,7 +121,7 @@ def help_text() -> str:
         "• grievance — file a grievance (demo)\n"
         "• stop — forget my session\n"
         "• admin <pass> ping|stats|reset — admin ops\n"
-        "For general questions, just ask in plain English/Marathi/Hindi."
+        "For general questions, reply in English/Marathi/Hindi."
     )
 
 def schemes_text() -> str:
@@ -86,7 +131,7 @@ def schemes_text() -> str:
         "• JJM: Functional tap connection\n"
         "• SHG: Livelihood & credit linkages\n"
         "• MGNREGS: Wage employment\n"
-        "_Reply with the scheme name for basics. For eligibility, send: ‘eligibility <scheme> <your details>’_"
+        "_Reply with ‘eligibility <scheme> <your details>’ for a quick check (demo)._"
     )
 
 def contact_text() -> str:
@@ -95,13 +140,12 @@ def contact_text() -> str:
         "• Zilla Parishad Helpline: 1800-000-000\n"
         "• Office hours: Mon–Fri 10:30–17:30\n"
         "• Email: help@zp.example.in\n"
-        "_This is a demo. Replace with your actual contacts._"
+        "_Replace with real contacts before going live._"
     )
 
 def status_lookup(app_id: str) -> str:
-    # Replace with real DB/API lookup
     fake = {
-        "PMAY123": ("Under review", "Verification scheduled within 7 days"),
+        "PMAY123": ("Under review", "Verification within 7 days"),
         "JJM456": ("Approved", "Connection expected in 30 days"),
         "SHG789": ("Pending docs", "Please submit bank passbook copy"),
     }
@@ -111,7 +155,6 @@ def status_lookup(app_id: str) -> str:
     return f"*Status for {app_id}:* {st[0]}\nNote: {st[1]}"
 
 def admin_ops(parts):
-    # admin <pass> <cmd>
     if len(parts) < 3:
         return "Usage: admin <passcode> <ping|stats|reset>"
     if parts[1] != ADMIN_PASSCODE:
@@ -126,10 +169,9 @@ def admin_ops(parts):
         return "All sessions cleared."
     return "Unknown admin command."
 
-def trivial_intents(text: str, sess: Dict[str, Any]) -> str | None:
+def trivial_intents(text: str, sess: Dict[str, Any]) -> Optional[str]:
     t = normalize(text)
 
-    # direct menu numbers
     if t in {"1", "schemes", "scheme", "yojana"}:
         sess["last_intent"] = "schemes"
         return schemes_text()
@@ -139,7 +181,7 @@ def trivial_intents(text: str, sess: Dict[str, Any]) -> str | None:
             "*Grievance (demo)*\n"
             "Reply in this format:\n"
             "`grievance <name> <village> <issue>`\n"
-            "Example: `grievance Priya Pal ‘Khadakde’ water not reaching last mile`\n"
+            "Example: `grievance Priya Pal Khadakde water not reaching last mile`\n"
             "You’ll get a ticket ID back."
         )
     if t in {"3", "status"}:
@@ -155,7 +197,6 @@ def trivial_intents(text: str, sess: Dict[str, Any]) -> str | None:
         sess["last_intent"] = "menu"
         return small_menu()
 
-    # structured patterns
     if t.startswith("status "):
         app_id = t.split(" ", 1)[1].strip()
         sess["last_intent"] = "status_lookup"
@@ -164,15 +205,13 @@ def trivial_intents(text: str, sess: Dict[str, Any]) -> str | None:
     if t.startswith("grievance "):
         payload = text.strip()[len("grievance "):].strip()
         if len(payload) < 4:
-            return "Please include some details: `grievance <name> <village> <issue>`"
-        # Fake ticket
+            return "Please include details: `grievance <name> <village> <issue>`"
         ticket = f"GRV{int(time.time())%100000:05d}"
         sess["last_intent"] = "grievance_ticket"
         sess["context"]["last_ticket"] = ticket
         return (
-            f"Thanks. Ticket *{ticket}* created.\n"
-            "You’ll receive an update after initial triage (ETA 48h, demo).\n"
-            "To add details, just reply in this chat."
+            f"Thanks. Ticket *{ticket}* created (demo).\n"
+            "You’ll receive an update after initial triage."
         )
 
     if t.startswith("admin "):
@@ -184,41 +223,45 @@ def trivial_intents(text: str, sess: Dict[str, Any]) -> str | None:
 
     return None
 
-
 def ai_answer(user_text: str, sess: Dict[str, Any]) -> str:
     """
-    If OPENAI_API_KEY is set, ask an LLM for a helpful, short answer.
-    Keep it safe and concise for WhatsApp.
+    AI fallback via Groq or OpenAI (OpenAI-compatible).
+    Returns empty string if AI is disabled or unavailable.
     """
-    if not AI:
+    if AI_CLIENT is None or AI_PROVIDER is None:
         return ""
+
     try:
-        # System prompt steers style; keep replies compact for WhatsApp
         system = (
-            "You are a helpful government service assistant. "
-            "Answer concisely (max ~3 sentences). Use simple language. "
-            "If you mention timelines or policies, add a gentle disclaimer like "
+            "You are a helpful district e-governance assistant. "
+            "Answer concisely (≤3 sentences) in simple language. "
+            "If policies/timelines vary by location, add: "
             "“process may vary by district—verify locally.”"
         )
-        msg = [
+
+        messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_text}
         ]
-        r = AI.chat.completions.create(model=AI_MODEL, messages=msg, temperature=0.2)
-        return (r.choices[0].message.content or "").strip()
+
+        result = AI_CLIENT.chat.completions.create(
+            model=AI_MODEL,
+            messages=messages,
+            temperature=0.2,
+        )
+        return (result.choices[0].message.content or "").strip()
     except Exception as e:
         logging.exception("AI error: %s", e)
         return ""
 
 
-# --- Routes -------------------------------------------------------------------
+# ---- Routes ------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def health():
     return f"{APP_NAME} is up"
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    # Twilio will send form-encoded payload
     wa_from = request.values.get("From", "")
     body = request.values.get("Body", "")
     if not wa_from:
@@ -228,16 +271,11 @@ def whatsapp_webhook():
     sess["id"] = wa_from
     sess["history"].append(("user", body))
 
-    # 1) Try deterministic intents first
     msg = trivial_intents(body, sess)
     if not msg:
-        # 2) If not matched, try AI fallback if available
         msg = ai_answer(body, sess)
     if not msg:
-        # 3) Final fallback
-        msg = (
-            "I didn’t catch that. Here’s the menu:\n\n" + small_menu()
-        )
+        msg = "I didn’t catch that. Here’s the menu:\n\n" + small_menu()
 
     sess["history"].append(("bot", msg))
     return reply_text(msg)
