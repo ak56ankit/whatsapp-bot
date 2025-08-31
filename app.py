@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 # Twilio reply helper (TwiML)
 from twilio.twiml.messaging_response import MessagingResponse
 
-# We use the OpenAI client for BOTH OpenAI and Groq (Groq exposes an OpenAI-compatible API).
+# OpenAI client is used for BOTH OpenAI and Groq (Groq exposes an OpenAI-compatible API).
 try:
     from openai import OpenAI
 except Exception:
@@ -16,22 +16,20 @@ load_dotenv()
 
 # ---- Config from environment -------------------------------------------------
 APP_NAME = os.getenv("APP_NAME", "ZP WhatsApp Bot")
-
-# Simple admin op passcode
 ADMIN_PASSCODE = os.getenv("ADMIN_PASSCODE", "1234")
 
-# LLM provider selection: "groq", "openai", or leave blank to disable AI fallback
+# LLM provider: "groq" or "openai" (leave blank to disable AI fallback)
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "").strip().lower()
 
 # Keys (set only what you use)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
-# Optional base URLs (rarely change; defaults are fine)
+# Optional base URLs
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip() or None
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "").strip() or "https://api.groq.com/openai/v1"
 
-# Optional explicit model override (else we pick a sensible default per provider)
+# Optional explicit model override
 AI_MODEL_OVERRIDE = os.getenv("AI_MODEL", "").strip()
 
 # ------------------------------------------------------------------------------
@@ -46,30 +44,30 @@ logging.basicConfig(level=logging.INFO)
 def build_ai_client() -> Tuple[Optional[str], Optional[Any], str]:
     """
     Returns: (provider, client, model_name)
-      - provider: "groq" | "openai" | None
-      - client:   OpenAI client object (or None)
-      - model:    resolved model string for the provider
+    provider: "groq" | "openai" | None
+    client:   OpenAI client object (or None)
+    model:    resolved model string
     """
     if OpenAI is None:
         return None, None, ""
 
-    # If user has chosen Groq (recommended for you right now)
+    # Explicit provider selection
     if LLM_PROVIDER == "groq" and GROQ_API_KEY:
         client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
         model = AI_MODEL_OVERRIDE or os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
         return "groq", client, model
 
-    # If user has chosen OpenAI
     if LLM_PROVIDER == "openai" and OPENAI_API_KEY:
         client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
         model = AI_MODEL_OVERRIDE or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         return "openai", client, model
 
-    # If no explicit provider, auto-select by available key (Groq preferred if present)
+    # Auto-select by available key (prefer Groq)
     if GROQ_API_KEY:
         client = OpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
         model = AI_MODEL_OVERRIDE or os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
         return "groq", client, model
+
     if OPENAI_API_KEY:
         client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
         model = AI_MODEL_OVERRIDE or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -78,7 +76,16 @@ def build_ai_client() -> Tuple[Optional[str], Optional[Any], str]:
     return None, None, ""
 
 
-AI_PROVIDER, AI_CLIENT, AI_MODEL = build_ai_client()
+# Try to init AI client, but don't let it crash the app
+try:
+    AI_PROVIDER, AI_CLIENT, AI_MODEL = build_ai_client()
+    if AI_PROVIDER:
+        app.logger.info(f"AI provider: {AI_PROVIDER}, model: {AI_MODEL}")
+    else:
+        app.logger.info("AI disabled (no provider/key).")
+except Exception as e:
+    AI_PROVIDER, AI_CLIENT, AI_MODEL = None, None, ""
+    logging.exception("AI init error (continuing without AI): %s", e)
 
 
 # ---- Helpers -----------------------------------------------------------------
